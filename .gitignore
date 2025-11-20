@@ -1,0 +1,9 @@
+# Project-specific artifacts that shouldn't be committed
+logs/
+data/
+checkpoints/
+
+# IDE and Python caches
+.idea/
+__pycache__/
+*.pyc
