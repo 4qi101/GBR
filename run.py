@@ -39,7 +39,7 @@ args.lr_scheduler = 'cos'            # 学习率调度器: 'linear', 'cos', 'ste
 args.eval_interval = 10               # 每N个epoch评估一次
 
 #  map曲线日志
-args.use_tensorboard = 1
+args.use_tensorboard = 0
 
 # 粒球模块参数
 args.gamma_ball = 1.0                      # 粒球对比损失权重
@@ -47,15 +47,15 @@ args.mgbcc_p = 64                             # MGBCC粒度参数，控制粒球
 args.mgbcc_t = 0.1                           # MGBCC跨视图交集阈值，控制粒球匹配的严格程度
 args.mgbcc_temperature = 0.3        # MGBCC对比学习温度参数
 
-args.use_affinity = 0  # 使用同视图匹配
+args.use_affinity = 1  # 使用同视图匹配
 args.mgbcc_sim_threshold = 0.679       # MGBCC同视图粒球相似度阈值（相似度 > 此值才匹配）
 
 # Memory Bank 参数
-args.use_memory_bank = 0
+args.use_memory_bank = 1
 args.lambda_mem = 0.1                 # memory bank 损失权重
 args.mem_momentum = 0.9              # memory bank 动量系数
 args.mem_temperature = 0.1           # memory bank 对比温度
-args.mem_negatives = 1024            # memory bank 负样本数量
+args.mem_negatives = 4096           # memory bank 负样本数量
 
 
 # 量化正则约束参数
