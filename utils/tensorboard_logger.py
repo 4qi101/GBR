@@ -1,14 +1,10 @@
 """Helper utilities for TensorBoard logging of training metrics."""
 import os
-from datetime import datetime
 from typing import Optional
 
 from torch.utils.tensorboard import SummaryWriter
 
-
-def _default_run_name(args) -> str:
-    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-    return f"{args.dset}_code{args.code_len}_bs{args.batch_size}_{timestamp}"
+from utils.experiment_utils import build_tensorboard_run_name
 
 
 def create_tb_writer(args) -> Optional[SummaryWriter]:
@@ -16,7 +12,7 @@ def create_tb_writer(args) -> Optional[SummaryWriter]:
     if not getattr(args, 'use_tensorboard', False):
         return None
 
-    run_name = _default_run_name(args)
+    run_name = build_tensorboard_run_name(args)
     log_dir = os.path.join(args.tensorboard_logdir, run_name)
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)

@@ -7,3 +7,8 @@ checkpoints/
 .idea/
 __pycache__/
 *.pyc
+scripts/pr_curves_data
+figure
+pr
+docs
+

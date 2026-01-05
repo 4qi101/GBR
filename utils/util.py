@@ -3,7 +3,7 @@ import torch
 from torch.backends import cudnn
 
 
-def seed_everything(seed=1234):
+def seed_everything(seed=42):
     """设置随机种子以确保实验可复现"""
     import random
     random.seed(seed)

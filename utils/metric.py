@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import scipy
 import torch
@@ -107,4 +108,73 @@ def calc_map_k(qB, rB, query_L, retrieval_L, k=None):
     return map
 
 
+def calc_and_save_pr(q_b, r_b, q_l, r_l, method_name, task_name, bit, save_dir='pr_curves_data'):
+    """Calculate average precision-recall curve and save to .npy.
+
+    q_b, r_b: binary codes {-1, 1} or {0, 1} for query and retrieval sets.
+    q_l, r_l: one-hot labels for query and retrieval sets.
+    """
+
+    def _to_numpy(x):
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().numpy()
+        return np.asarray(x)
+
+    q_b = _to_numpy(q_b)
+    r_b = _to_numpy(r_b)
+    q_l = _to_numpy(q_l)
+    r_l = _to_numpy(r_l)
+
+    if q_b.ndim == 1:
+        q_b = q_b.reshape(1, -1)
+    if r_b.ndim == 1:
+        r_b = r_b.reshape(1, -1)
+    if q_l.ndim == 1:
+        q_l = q_l.reshape(1, -1)
+    if r_l.ndim == 1:
+        r_l = r_l.reshape(1, -1)
+
+    q_b = np.where(q_b > 0, 1, -1).astype(np.int8)
+    r_b = np.where(r_b > 0, 1, -1).astype(np.int8)
+
+    num_query = q_b.shape[0]
+    num_retrieval = r_b.shape[0]
+    code_length = q_b.shape[1]
+
+    inner = np.matmul(q_b, r_b.T).astype(np.int32)
+    dist = 0.5 * (code_length - inner).astype(np.float32)
+
+    gnd = np.matmul(q_l, r_l.T) > 0
+    gnd = gnd.astype(np.float32)
+
+    order = np.argsort(dist, axis=1)
+    gnd_sorted = np.take_along_axis(gnd, order, axis=1)
+
+    num_rel = np.sum(gnd_sorted, axis=1)
+    valid = num_rel > 0
+
+    if not np.any(valid):
+        precision = np.zeros(num_retrieval, dtype=np.float32)
+        recall = np.zeros(num_retrieval, dtype=np.float32)
+    else:
+        gnd_valid = gnd_sorted[valid]
+        num_rel_valid = num_rel[valid][:, None]
+
+        cumsum = np.cumsum(gnd_valid, axis=1)
+        ranks = np.arange(1, num_retrieval + 1, dtype=np.float32).reshape(1, -1)
+
+        precision_q = cumsum / ranks
+        recall_q = cumsum / num_rel_valid
+
+        precision = precision_q.mean(axis=0).astype(np.float32)
+        recall = recall_q.mean(axis=0).astype(np.float32)
+
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir, exist_ok=True)
+
+    filename = "{}_{}_{}.npy".format(method_name, task_name, bit)
+    out_path = os.path.join(save_dir, filename)
+    np.save(out_path, {"P": precision, "R": recall})
+
+    return precision, recall
 

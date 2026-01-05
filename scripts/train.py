@@ -7,19 +7,20 @@ import os
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
+import random
+import numpy as np
 from copy import deepcopy
 
 from utils.config import args
 from utils.util import seed_everything
 from nets.nets import ImgNet_T, TxtNet_T
 from utils.data import get_dataloaders
-from scripts.eval import eval_retrieval_target
+from scripts.eval import eval_retrieval_target, eval_pr_curves
 from src.granular_loss import compute_granular_ball_loss
-from src.memory_bank import MomentumBinaryMemoryBank
 from src.mgbcc_style_balls import MultiviewGCLoss
-from src.regularization import quantization_loss, bit_balance_loss
 from utils.tensorboard_logger import create_tb_writer, log_eval_metrics, log_train_scalar
-from utils.debug_tools import log_memory_bank_loss
+from utils.experiment_utils import save_checkpoint
+from utils.viz_utils import visualize_embeddings_after_training
 
 
 def main():
@@ -89,21 +90,7 @@ def main():
     # 6. 训练参数
     p_cfg = args.mgbcc_p
     gamma = args.gamma_ball
-    lambda_mem = args.lambda_mem
-    mem_momentum = args.mem_momentum
-    mem_temperature = args.mem_temperature
-    mem_negatives = args.mem_negatives
-
-    # 6.1 初始化memory bank
-    memory_bank = None
-    if args.use_memory_bank and lambda_mem > 0:
-        num_train_samples = len(train_dl.dataset)
-        memory_bank = MomentumBinaryMemoryBank(
-            num_samples=num_train_samples,
-            code_dim=args.code_len,
-            momentum=mem_momentum,
-            device=device,
-        )
+    map_topk = args.map_topk if getattr(args, 'map_topk', 0) > 0 else None
     
     # 7. 最佳模型跟踪
     best_avg_map = -1.0
@@ -125,17 +112,27 @@ def main():
             criterion_gra_global,
             p_cfg,
             gamma,
-            memory_bank,
-            lambda_mem=lambda_mem,
-            mem_negatives=mem_negatives,
-            mem_temperature=mem_temperature,
             device=device,
             tb_writer=tb_writer,
         )
-        
-        # 评估
+
+        # 评估逻辑
         should_eval = (epoch == 0 or (epoch + 1) % args.eval_interval == 0 or epoch == args.epochs - 1)
+        is_new_best = False
+
         if should_eval:
+            # =========================================================
+            # [Fix] 核心修改：全方位随机数锁 (RNG Lock)
+            # 进入评估前，保存 Torch, CUDA, Numpy, Python Random 的所有状态
+            # 确保评估过程（包括t-SNE和数据加载）完全“隐形”，不影响训练的随机序列
+            # =========================================================
+            rng_state = torch.get_rng_state()
+            cuda_rng_state = torch.cuda.get_rng_state(device=device) if torch.cuda.is_available() else None
+            np_rng_state = np.random.get_state()
+            py_rng_state = random.getstate()
+            # =========================================================
+
+            # --- 开始评估 ---
             mapi2t, mapt2i = eval_retrieval_target(
                 img_net,
                 txt_net,
@@ -143,16 +140,17 @@ def main():
                 retrieval_dl,
                 db_name=args.dset,
                 device=device,
+                topk=map_topk,
             )
             avg_map = (mapi2t + mapt2i) / 2.0
-            
-            print(f'\n[Epoch {epoch+1}/{args.epochs}] Evaluation Results:')
+
+            print(f'\n[Epoch {epoch + 1}/{args.epochs}] Evaluation Results:')
             print(f'  Image->Text MAP: {mapi2t:.6f}')
             print(f'  Text->Image MAP: {mapt2i:.6f}')
             print(f'  Average MAP: {avg_map:.6f}')
             log_eval_metrics(tb_writer, epoch + 1, mapi2t, mapt2i, avg_map)
-            
-            # 保存最佳模型
+
+            # --- 保存最佳模型 ---
             if avg_map > best_avg_map:
                 best_avg_map = avg_map
                 best_epoch = epoch + 1
@@ -162,7 +160,8 @@ def main():
                 }
                 best_mapi2t = mapi2t
                 best_mapt2i = mapt2i
-                
+                is_new_best = True
+
                 # 保存检查点
                 checkpoint = {
                     'epoch': epoch + 1,
@@ -173,16 +172,64 @@ def main():
                     'mapt2i': mapt2i,
                     'avg_map': avg_map,
                 }
-                
+
                 # 构建保存文件名
-                ckpt_name = f"{args.dset}_{args.code_len}bit_p{args.mgbcc_p}_t{args.mgbcc_t}_gamma{args.gamma_ball}_best.pth"
-                ckpt_path = os.path.join(args.save_dir, ckpt_name)
-                torch.save(checkpoint, ckpt_path)
+                ckpt_path = save_checkpoint(args, checkpoint, suffix='best')
                 print(f'  ==> Saved best nets to {ckpt_path}')
-        
-        # 更新学习率
+
+                if args.enable_pr_on_ckpt:
+                    try:
+                        print('  ==> Computing PR curves for current best model...')
+                        method_name = 'GBR'
+                        bit = args.code_len
+                        save_dir = os.path.join('pr_curves_data', args.dset)
+                        eval_pr_curves(
+                            img_net,
+                            txt_net,
+                            test_dl,
+                            retrieval_dl,
+                            db_name=args.dset,
+                            device=device,
+                            method_name=method_name,
+                            bit=bit,
+                            save_dir=save_dir,
+                        )
+                        print(f'  ==> PR curves saved to {save_dir} for current best model.')
+                    except Exception as e:
+                        print(f'[PR] Failed to compute PR curves for current best model: {e}')
+
+            # --- 可视化 (t-SNE) ---
+            if getattr(args, 'viz_tsne', False) and (epoch + 1) > 40 and is_new_best:
+                print(f'  ==> Generating visualization figures (t-SNE) at epoch {epoch + 1}...')
+                try:
+                    visualize_embeddings_after_training(
+                        img_net=img_net,
+                        txt_net=txt_net,
+                        loader=train_dl,
+                        device=device,
+                        args=args,
+                        epoch=epoch + 1,
+                    )
+                except Exception as e:
+                    print(f'[Viz] Failed to generate visualization: {e}')
+
+            # =========================================================
+            # [Fix] 核心修改：恢复状态
+            # 评估结束，把所有随机数指针拨回评估前的瞬间
+            # =========================================================
+            torch.set_rng_state(rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state, device=device)
+            np.random.set_state(np_rng_state)
+            random.setstate(py_rng_state)
+            # =========================================================
+
+        # 更新学习率 (保持在 should_eval 块之外)
         if args.lr_scheduler == 'plateau':
-            scheduler.step(avg_map if should_eval else 0)
+            # 注意：如果跳过评估，plateau 默认不更新（或者你可以传入上次的 avg_map）
+            # 这里传入 0 是为了语法占位，实际 plateau 需要有效的 metric 才能 step
+            current_metric = avg_map if should_eval else 0.0
+            scheduler.step(current_metric)
         else:
             scheduler.step()
     
@@ -202,11 +249,27 @@ def main():
             retrieval_dl,
             db_name=args.dset,
             device=device,
+            topk=map_topk,
         )
         avg_map = (mapi2t + mapt2i) / 2.0
         print(f'  Image->Text MAP: {mapi2t:.6f}')
         print(f'  Text->Image MAP: {mapt2i:.6f}')
         print(f'  Average MAP: {avg_map:.6f}')
+
+    if getattr(args, 'viz_tsne', False):
+        print('\n===> Generating visualization figures (t-SNE)...')
+        try:
+            final_epoch = best_epoch if best_epoch != -1 else args.epochs
+            visualize_embeddings_after_training(
+                img_net=img_net,
+                txt_net=txt_net,
+                loader=train_dl,
+                device=device,
+                args=args,
+                epoch=final_epoch,
+            )
+        except Exception as e:
+            print(f'[Viz] Failed to generate visualization: {e}')
     
     print('=' * 80)
 
@@ -222,42 +285,36 @@ def main():
         tb_writer.close()
 
 
-def train_epoch(epoch, img_net, txt_net, train_loader, optimizer, 
+def train_epoch(epoch, img_net, txt_net, train_loader, optimizer,
                    criterion_gra_global, p_cfg, gamma,
-                   memory_bank: MomentumBinaryMemoryBank,
-                   lambda_mem: float,
-                   mem_negatives: int,
-                   mem_temperature: float,
                    device: torch.device,
                    tb_writer=None):
     """训练一个epoch"""
     img_net.train()
     txt_net.train()
-    
+
     running_loss = 0.0
+    total_Lh_ball = 0.0
     num_samples = 0
     num_batches = len(train_loader)
-    
-    for batch_idx, (images, texts, labels, indices) in enumerate(train_loader):
+
+    for batch_idx, (images, texts, _labels, _indices) in enumerate(train_loader):
         images = images.to(device)
         texts = texts.to(device)
-        indices = indices.to(device)
-        
-        # 前向传播
+
+        # Step 1: 前向传播（query encoder）- 使用当前 img_net/txt_net 计算查询特征 q
         _, _, _, img_code = img_net(images)
         _, _, _, txt_code = txt_net(texts)
-        
+
         # 归一化特征（与UCCH一致）
         v_img = F.normalize(img_code, dim=1, eps=1e-8)
         v_txt = F.normalize(txt_code, dim=1, eps=1e-8)
         v_img = torch.nan_to_num(v_img, nan=0.0, posinf=1.0, neginf=-1.0)
         v_txt = torch.nan_to_num(v_txt, nan=0.0, posinf=1.0, neginf=-1.0)
-        
-        # 构球与中心级对比（与UCCH一致）
+
+        # Step 3: 构球与中心级对比损失 Lh_ball（批内粒球）
         Lh_ball = torch.tensor(0.0, device=v_img.device)
-        
         if gamma > 0:
-            # 仅使用批内粒球（与UCCH一致）
             Lh_ball = compute_granular_ball_loss(
                 v_img,
                 v_txt,
@@ -265,80 +322,43 @@ def train_epoch(epoch, img_net, txt_net, train_loader, optimizer,
                 temperature=args.mgbcc_temperature,
                 match_threshold=args.mgbcc_t,
                 criterion=criterion_gra_global,
+                return_aux=False,
             )
+
             if torch.isnan(Lh_ball) or torch.isinf(Lh_ball):
                 Lh_ball = torch.tensor(0.0, device=v_img.device)
-        
-        # Memory Bank 损失
-        L_mem = torch.tensor(0.0, device=v_img.device)
-        if args.use_memory_bank and lambda_mem > 0 and memory_bank is not None:
-            L_mem_img = memory_bank.contrastive_loss(
-                v_img,
-                indices,
-                num_negatives=mem_negatives,
-                temperature=mem_temperature,
-            )
-            L_mem_txt = memory_bank.contrastive_loss(
-                v_txt,
-                indices,
-                num_negatives=mem_negatives,
-                temperature=mem_temperature,
-            )
-            L_mem = (L_mem_img + L_mem_txt) * 0.5
-            log_memory_bank_loss(
-                L_mem_img,
-                L_mem_txt,
-                mem_negatives,
-                prefix=f"MemBank(epoch={epoch+1}, batch={batch_idx+1})",
-            )
 
-        # 量化损失：拉近连续码与二值码
-        L_quant = torch.tensor(0.0, device=v_img.device)
-        if args.use_quantization and args.lambda_quant > 0:
-            L_quant_img = quantization_loss(img_code, detach_target=True)
-            L_quant_txt = quantization_loss(txt_code, detach_target=True)
-            L_quant = (L_quant_img + L_quant_txt) * 0.5
-        
-        # 位平衡损失：鼓励每一位0/1均衡
-        L_balance = torch.tensor(0.0, device=v_img.device)
-        if args.use_bit_balance and args.lambda_balance > 0:
-            L_balance_img = bit_balance_loss(img_code)
-            L_balance_txt = bit_balance_loss(txt_code)
-            L_balance = (L_balance_img + L_balance_txt) * 0.5
+        # Step 4: 汇总总损失，并对 query encoder 反向更新
+        loss = gamma * Lh_ball
 
-        # 总损失
-        loss = (gamma * Lh_ball + 
-                lambda_mem * L_mem + 
-                args.lambda_quant * L_quant + 
-                args.lambda_balance * L_balance)
-        
-        # 反向传播
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
-            list(img_net.parameters()) + list(txt_net.parameters()), 
-            max_norm=10.0
+            list(img_net.parameters()) + list(txt_net.parameters()),
+            max_norm=10.0,
         )
         optimizer.step()
 
         running_loss += loss.item()
+        total_Lh_ball += Lh_ball.item() if isinstance(Lh_ball, torch.Tensor) else float(Lh_ball)
         num_samples += 1
 
-        if args.use_memory_bank and memory_bank is not None:
-            with torch.no_grad():
-                avg_feature = 0.5 * (v_img + v_txt)
-                memory_bank.update(indices, avg_feature)
-        
         # 打印进度
         if (batch_idx + 1) % 50 == 0 or (batch_idx + 1) == num_batches:
             current_lr = optimizer.param_groups[0]['lr']
             avg_loss = running_loss / (batch_idx + 1)
-            print(f'Epoch [{epoch+1}/{args.epochs}] Batch [{batch_idx+1}/{num_batches}] '
-                  f'Loss: {avg_loss:.4f} LR: {current_lr:.6f}')
+            print(
+                f'Epoch [{epoch+1}/{args.epochs}] Batch [{batch_idx+1}/{num_batches}] '
+                f'Loss: {avg_loss:.4f} LR: {current_lr:.6f}'
+            )
 
     # Epoch-level logging
-    epoch_avg_loss = running_loss / max(num_samples, 1)
+    denom = max(num_samples, 1)
+    epoch_avg_loss = running_loss / denom
+    avg_Lh_ball = total_Lh_ball / denom
+
     log_train_scalar(tb_writer, 'train/loss', epoch_avg_loss, epoch)
+    log_train_scalar(tb_writer, 'train/Lh_ball', avg_Lh_ball, epoch)
 
 
 if __name__ == '__main__':

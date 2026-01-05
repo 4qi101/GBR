@@ -6,7 +6,7 @@
 
 import torch
 import torch.nn.functional as F
-from src.mgbcc_style_balls import MVGBList, MultiviewGCLoss
+from src.mgbcc_style_balls import MVGBList, MultiviewGCLoss, relation_of_views_gblists_tensor
 
 
 def compute_granular_ball_loss(
@@ -16,6 +16,7 @@ def compute_granular_ball_loss(
     temperature=1.0,
     match_threshold=0.1,
     criterion=None,
+    return_aux: bool = False,
 ):
     """
     计算粒球对比损失（与UCCH项目一致）
@@ -52,5 +53,30 @@ def compute_granular_ball_loss(
 
     # 计算损失
     loss_gb = criterion(mv_gb_list)
-    
-    return loss_gb
+
+    if not return_aux:
+        return loss_gb
+
+    gb_img = mv_gb_list[0]
+    gb_txt = mv_gb_list[1]
+
+    centers_img = gb_img.get_centers()
+    centers_txt = gb_txt.get_centers()
+
+    assign_img = gb_img.y_parts
+    assign_txt = gb_txt.y_parts
+
+    relation_matrix = relation_of_views_gblists_tensor(
+        gb_img,
+        gb_txt,
+        t=match_threshold,
+    )
+
+    return (
+        loss_gb,
+        centers_img,
+        centers_txt,
+        assign_img,
+        assign_txt,
+        relation_matrix,
+    )
